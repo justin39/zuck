@@ -1,0 +1,108 @@
+#!/bin/env python3
+import curses
+import threading
+import logging.config
+from fbchat import Client
+from fbchat.models import *
+from sys import exit
+from sys import stderr
+from enum import Enum
+
+class Mode(Enum):
+    CHAT = 0
+    NAVI = 1
+
+# Globals
+mode = Mode.CHAT
+name_cache = {}
+client = None
+
+class ChatClient(Client):
+    window = None
+    def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
+        if not self.window.scrolling and thread_id == self.window.tid:
+            self.window.display_chat()
+
+class ChatWindow:
+    def __init__(self, window, tid):
+        self.scrolling = False
+        self.window = window
+        self.tid = tid
+
+    def display_chat(self, timestamp=None):
+        messages = client.fetchThreadMessages(self.tid, limit=20, before=timestamp)
+        messages.reverse()
+        for msg in messages:
+            self.window.addstr(get_name(msg.author) + ":\n", curses.A_BOLD)
+            self.window.addstr(msg.text + "\n\n")
+        self.window.refresh()
+
+def login(usr, pwd):
+    try:
+        return ChatClient(usr, pwd, max_tries=3, logging_level=logging.CRITICAL)
+        # return ChatClient(usr, pwd, max_tries=3)
+    except FBchatException as e:
+        stderr.write("Failed to login!")
+        sys.exit(1)
+    except FBchatUserError:
+        stderr.write("Incorrect credentials!")
+        sys.exit(1)
+
+def listen_thread():
+    client.listen()
+
+def get_name(uid):
+    if uid not in name_cache:
+        retval = client.fetchThreadInfo(uid)[uid]
+        name_cache[uid] = retval.name
+    return name_cache[uid]
+
+def chat(stdscr):
+    stdscr.clear()
+    curses.noecho()
+    curses.cbreak()
+    stdscr.keypad(True)
+    curses.curs_set(False)
+
+    lines = curses.LINES - 1
+    cols = curses.COLS
+
+    thlist = client.fetchThreadList(limit=1)
+    win = curses.newwin(lines - 2, cols//3, 1, 1)
+    win_outer = curses.newwin(lines, cols//3 + 2)
+    win_outer.box()
+    win_outer.refresh()
+    cw = ChatWindow(win, thlist[0].uid)
+    client.window = cw
+    cw.window.idlok(True)
+    cw.window.scrollok(True)
+
+    cw.display_chat()
+
+    lthread = threading.Thread(target=listen_thread)
+    lthread.daemon = True
+    lthread.start()
+
+    chatbox = curses.newwin(lines - 2, cols//3, 1, cols//3 + 2)
+    chatbox_outer = curses.newwin(lines, cols//3 + 2, 0, cols//3 + 1)
+    chatbox_outer.box()
+    chatbox_outer.refresh()
+
+    while (True):
+        chatbox.getkey()
+
+if __name__ == '__main__':
+    from sys import argv
+    import getpass
+    username = ''
+    password = ''
+    if len(argv) > 1:
+        username = argv[1]
+    else:
+        username = input('Username: ')
+    password = getpass.getpass('Password: ')
+    client = login(username, password)
+    print("Successfully logged in as", username)
+    print("Starting zuck...")
+    curses.wrapper(chat)
+    client.logout()
