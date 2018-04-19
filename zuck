@@ -14,14 +14,14 @@ class Mode(Enum):
     NAVI = 1
 
 # Globals
-mode = Mode.CHAT
 name_cache = {}
 client = None
+mode = Mode.NAVI
 
 class ChatClient(Client):
     chat = None
     def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
-        if not self.chat.scrolling and thread_id == self.chat.tid:
+        if not self.chat.scrolling and thread_id == self.chat.threads[self.chat.idx].uid:
             self.chat.display_chat()
         else:
             self.chat.update_bar()
@@ -38,14 +38,20 @@ class ChatState:
         messages = client.fetchThreadMessages(self.threads[self.idx].uid, limit=20, before=timestamp)
         messages.reverse()
         for msg in messages:
-            self.chatwin.window.addstr(get_name(msg.author) + ":\n", curses.A_BOLD)
+            attr = 0
+            if msg.author == client.uid:
+                attr = curses.color_pair(5)
+            self.chatwin.window.addstr(get_name(msg.author) + ":\n", attr | curses.A_BOLD)
+            if msg.author == client.uid:
+                attr = curses.color_pair(4)
             if msg.text:
-                self.chatwin.window.addstr(msg.text + "\n\n")
+                self.chatwin.window.addstr(msg.text + "\n\n", attr)
             elif msg.sticker:
-                self.chatwin.window.addstr('[' + msg.sticker.label + ']\n\n')
+                self.chatwin.window.addstr('[' + msg.sticker.label + ']\n\n', attr)
         self.chatwin.refresh()
 
     def update_bar(self):
+        tid = self.threads[self.idx].uid
         self.bar.window.erase()
         self.threads = client.fetchThreadList()
         unread = client.fetchUnread()
@@ -53,7 +59,7 @@ class ChatState:
         i = 0
         while written < self.bar.width:
             attr = 0
-            if self.threads[i].uid == self.threads[self.idx].uid:
+            if self.threads[i].uid == tid:
                 attr = curses.A_UNDERLINE | curses.color_pair(2)
                 self.idx = i
             if self.threads[i].uid in unread:
@@ -72,6 +78,7 @@ class ChatState:
         if self.idx == 0:
             return
         self.idx -= 1
+        client.markAsRead(self.threads[self.idx].uid)
         self.update_bar()
         self.display_chat()
 
@@ -79,6 +86,7 @@ class ChatState:
         if self.idx == 19:
             return
         self.idx += 1
+        client.markAsRead(self.threads[self.idx].uid)
         self.update_bar()
         self.display_chat()
 
@@ -112,8 +120,7 @@ class Panel:
 
 def login(usr, pwd):
     try:
-        return ChatClient(usr, pwd, max_tries=3, logging_level=logging.CRITICAL)
-        # return ChatClient(usr, pwd, max_tries=3)
+        return ChatClient(usr, pwd, max_tries=1, logging_level=logging.CRITICAL)
     except FBchatException as e:
         stderr.write("Failed to login!")
         sys.exit(1)
@@ -131,21 +138,30 @@ def get_name(uid):
     return name_cache[uid]
 
 def validate(ch):
-    return ch
-    if ch == 10 or ch == 13 or ch == curses.KEY_ENTER:
+    global mode
+
+    if ch == 27:
+        mode = Mode.NAVI
         return 7
+    elif ch == 10 or ch == 13 or ch == curses.KEY_ENTER:
+        return 7
+    else:
+        return ch
 
 def chat(stdscr):
+    global mode
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, 25, -1)
+    curses.init_pair(5, 27, -1)
     stdscr.clear()
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
-    curses.curs_set(False)
-
-    mode = Mode.NAVI
+    # curses.curs_set(False)
 
     lines = curses.LINES - 1
     cols = curses.COLS
@@ -169,7 +185,7 @@ def chat(stdscr):
     panel = Panel(height, width, 2, width+3)
 
     # Text input
-    textwin = Panel(height//3, width - 2, height - height//3 + 1, width + 4)
+    textwin = Panel(height//3, width - 4, height - height//3 + 1, width + 5)
     textbox = curses.textpad.Textbox(textwin.window)
 
     # Status bar
@@ -187,7 +203,16 @@ def chat(stdscr):
         textwin.update()
         curses.doupdate()
         if mode == Mode.CHAT:
-            msg = textbox.edit(validate)
+            textbox.edit(validate)
+            message = textbox.gather()
+            textwin.window.clear()
+            if mode == Mode.CHAT and len(message) > 0:
+                client.send(Message(text=message), thread_id=cs.threads[cs.idx].uid, thread_type=cs.threads[cs.idx].type)
+                cs.display_chat()
+            elif mode == Mode.NAVI:
+                win.active = True
+                textwin.active = False
+                continue
         elif mode == Mode.NAVI:
             ch = win.window.getch()
             if ch == ord('q'):
@@ -216,3 +241,4 @@ if __name__ == '__main__':
     print("Starting zuck...")
     curses.wrapper(chat)
     client.logout()
+    print("Successfully logged out.")
