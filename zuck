@@ -1,5 +1,6 @@
 #!/bin/env python3
 import curses
+import curses.textpad
 import threading
 import logging.config
 from fbchat import Client
@@ -18,24 +19,96 @@ name_cache = {}
 client = None
 
 class ChatClient(Client):
-    window = None
+    chat = None
     def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
-        if not self.window.scrolling and thread_id == self.window.tid:
-            self.window.display_chat()
+        if not self.chat.scrolling and thread_id == self.chat.tid:
+            self.chat.display_chat()
+        else:
+            self.chat.update_bar()
 
-class ChatWindow:
-    def __init__(self, window, tid):
+class ChatState:
+    def __init__(self, chatwin, bar):
         self.scrolling = False
-        self.window = window
-        self.tid = tid
+        self.chatwin = chatwin
+        self.bar = bar
+        self.threads = client.fetchThreadList()
+        self.idx = 0
 
     def display_chat(self, timestamp=None):
-        messages = client.fetchThreadMessages(self.tid, limit=20, before=timestamp)
+        messages = client.fetchThreadMessages(self.threads[self.idx].uid, limit=20, before=timestamp)
         messages.reverse()
         for msg in messages:
-            self.window.addstr(get_name(msg.author) + ":\n", curses.A_BOLD)
-            self.window.addstr(msg.text + "\n\n")
-        self.window.refresh()
+            self.chatwin.window.addstr(get_name(msg.author) + ":\n", curses.A_BOLD)
+            if msg.text:
+                self.chatwin.window.addstr(msg.text + "\n\n")
+            elif msg.sticker:
+                self.chatwin.window.addstr('[' + msg.sticker.label + ']\n\n')
+        self.chatwin.refresh()
+
+    def update_bar(self):
+        self.bar.window.erase()
+        self.threads = client.fetchThreadList()
+        unread = client.fetchUnread()
+        written = 0
+        i = 0
+        while written < self.bar.width:
+            attr = 0
+            if self.threads[i].uid == self.threads[self.idx].uid:
+                attr = curses.A_UNDERLINE | curses.color_pair(2)
+                self.idx = i
+            if self.threads[i].uid in unread:
+                attr |= curses.A_BOLD
+            self.bar.window.addstr(self.threads[i].name, attr)
+            i += 1
+            written += len(self.threads[i].name)
+            if len(self.threads[i].name) + 3 + written > self.bar.width:
+                break
+            else:
+                self.bar.window.addstr(' | ')
+                written += 3
+        self.bar.refresh()
+
+    def prev_thread(self):
+        if self.idx == 0:
+            return
+        self.idx -= 1
+        self.update_bar()
+        self.display_chat()
+
+    def next_thread(self):
+        if self.idx == 19:
+            return
+        self.idx += 1
+        self.update_bar()
+        self.display_chat()
+
+class Panel:
+    def __init__(self, height, width, y, x, outline = True):
+        self.height = height
+        self.width = width
+        self.y = y
+        self.x = x
+        if outline:
+            self.box = curses.newwin(height, width, y, x)
+            self.window = curses.newwin(height - 2, width - 2, y + 1, x + 1)
+        else:
+            self.window = curses.newwin(height, width, y, x)
+        self.active = False
+        self.outline = outline
+
+    def update(self):
+        self.window.redrawwin()
+        if self.outline:
+            if self.active:
+                self.box.attrset(curses.color_pair(1))
+            self.box.box()
+            self.box.noutrefresh()
+            self.box.attrset(0)
+        self.window.noutrefresh()
+
+    def refresh(self):
+        self.update()
+        curses.doupdate()
 
 def login(usr, pwd):
     try:
@@ -57,39 +130,76 @@ def get_name(uid):
         name_cache[uid] = retval.name
     return name_cache[uid]
 
+def validate(ch):
+    return ch
+    if ch == 10 or ch == 13 or ch == curses.KEY_ENTER:
+        return 7
+
 def chat(stdscr):
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     stdscr.clear()
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
     curses.curs_set(False)
 
+    mode = Mode.NAVI
+
     lines = curses.LINES - 1
     cols = curses.COLS
+    height = lines - 3
+    width = cols//3
 
+    # Initial chat
     thlist = client.fetchThreadList(limit=1)
-    win = curses.newwin(lines - 2, cols//3, 1, 1)
-    win_outer = curses.newwin(lines, cols//3 + 2)
-    win_outer.box()
-    win_outer.refresh()
-    cw = ChatWindow(win, thlist[0].uid)
-    client.window = cw
-    cw.window.idlok(True)
-    cw.window.scrollok(True)
 
-    cw.display_chat()
+    win = Panel(height, width, 2, 0)
+    win.active = True
+    win.window.idlok(True)
+    win.window.scrollok(True)
 
+    # Listening thread
     lthread = threading.Thread(target=listen_thread)
     lthread.daemon = True
     lthread.start()
 
-    chatbox = curses.newwin(lines - 2, cols//3, 1, cols//3 + 2)
-    chatbox_outer = curses.newwin(lines, cols//3 + 2, 0, cols//3 + 1)
-    chatbox_outer.box()
-    chatbox_outer.refresh()
+    # Next panel
+    panel = Panel(height, width, 2, width+3)
+
+    # Text input
+    textwin = Panel(height//3, width - 2, height - height//3 + 1, width + 4)
+    textbox = curses.textpad.Textbox(textwin.window)
+
+    # Status bar
+    bar = Panel(2, cols, 0, 0, False)
+
+    cs = ChatState(win, bar)
+    client.chat = cs
+    cs.display_chat()
+    cs.update_bar()
 
     while (True):
-        chatbox.getkey()
+        bar.update()
+        win.update()
+        panel.update()
+        textwin.update()
+        curses.doupdate()
+        if mode == Mode.CHAT:
+            msg = textbox.edit(validate)
+        elif mode == Mode.NAVI:
+            ch = win.window.getch()
+            if ch == ord('q'):
+                return
+            elif ch == ord('i'):
+                mode = Mode.CHAT
+                win.active = False
+                textwin.active = True
+            elif ch == ord('h') or ch == curses.KEY_LEFT:
+                cs.prev_thread()
+            elif ch == ord('l') or ch == curses.KEY_RIGHT:
+                cs.next_thread()
 
 if __name__ == '__main__':
     from sys import argv
