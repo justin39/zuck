@@ -15,10 +15,10 @@ class Mode(Enum):
     NAVI = 1
 
 # Globals
-name_cache = {}
 client = None
-mode = Mode.NAVI
 THREAD_MAX = 20
+MSG_MAX = 20
+HISTORY_MAX = 200
 
 class ChatClient(Client):
     def __init__(self, *args, **kwargs):
@@ -29,7 +29,11 @@ class ChatClient(Client):
         self.w_text = None
         self.textbox = None
         self.threads = None
-        self.current = 0
+        self.tid = 0
+        self.mode = Mode.NAVI
+        self.name_cache = {}
+        self.history = [None]
+        self.wrapper = None
 
     def init_chat(self):
         self.threads = client.fetchThreadList()
@@ -37,6 +41,9 @@ class ChatClient(Client):
         cols = curses.COLS
         height = lines - 3
         width = cols//3
+
+        # TextWrapper object
+        self.wrapper = textwrap.TextWrapper(width=width-2, initial_indent='    ', subsequent_indent='    ')
 
         # Chat window
         self.w_chat = Panel(height, width, 2, 0)
@@ -57,34 +64,58 @@ class ChatClient(Client):
 
 
     def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
-        if not self.scrolling and thread_id == self.threads[self.current].uid:
+        if not self.scrolling and thread_id == self.threads[self.tid].uid:
             self.display_chat()
         else:
             self.update_bar()
 
     def display_chat(self, timestamp=None):
-        messages = self.fetchThreadMessages(self.threads[self.current].uid, limit=THREAD_MAX, before=timestamp)
-        messages.reverse()
-        for msg in messages:
+        self.w_chat.window.erase()
+        messages = self.fetchThreadMessages(self.threads[self.tid].uid, limit=MSG_MAX, before=timestamp)
+        lines = 0
+        display = []
+        i = 0
+        while lines < self.w_chat.height - 2 and i < len(messages):
+            text = ''
+            if messages[i].text:
+                text = messages[i].text
+            elif messages[i].attachments:
+                # text = ', '.join([self.fetchImageUrl(a.uid) for a in messages[i].attachments])
+                text = '<NOT SUPPORTED'
+            elif messages[i].sticker:
+                text = '[' + messages[i].sticker.url + ']'
+            else:
+                text = '<NOT SUPPORTED>'
+            wrapped = self.wrapper.wrap(text)
+            name = self.get_name(messages[i].author) + ":"
+            wrapped.insert(0, name)
+            wrapped.append(messages[i].author)
+            display.append(wrapped)
+            lines += len(wrapped) - 1
+            i += 1
+
+        if self.scrolling:
+            display[0][0] = '▶' + display[0][0]
+
+        display.reverse()
+        for idx, msg in enumerate(display):
             attr = 0
-            if msg.author == client.uid:
-                attr = curses.color_pair(5)
-            self.w_chat.window.addstr(get_name(msg.author) + ":\n", attr | curses.A_BOLD)
-            if msg.author == client.uid:
+            nameattr = 0
+            author = msg.pop()
+            if author == client.uid:
+                nameattr = curses.color_pair(5)
                 attr = curses.color_pair(4)
-            if msg.text:
-                self.w_chat.window.addstr(msg.text + "\n\n", attr)
-            if msg.attachments:
-                for a in msg.attachments:
-                    url = client.fetchImageUrl(a.uid)
-                    self.w_chat.window.addstr(url + "\n")
-            if msg.sticker:
-                self.w_chat.window.addstr('[' + msg.sticker.url + ']\n\n', attr)
+            if self.scrolling and idx == len(display) - 1:
+                nameattr |= curses.A_UNDERLINE
+            self.w_chat.window.addstr(msg.pop(0) +"\n", nameattr | curses.A_BOLD)
+            for l in msg:
+                self.w_chat.window.addstr(l + "\n", attr)
+
         self.w_chat.refresh()
         self.w_text.refresh()
 
     def update_bar(self):
-        tid = self.threads[self.current].uid
+        tid = self.threads[self.tid].uid
         self.w_bar.window.erase()
         self.threads = self.fetchThreadList()
         unread = client.fetchUnread()
@@ -94,7 +125,7 @@ class ChatClient(Client):
             attr = 0
             if self.threads[i].uid == tid:
                 attr = curses.A_UNDERLINE | curses.color_pair(2)
-                self.current = i
+                self.tid = i
             if self.threads[i].uid in unread:
                 attr |= curses.A_BOLD
             self.w_bar.window.addstr(self.threads[i].name, attr)
@@ -110,23 +141,52 @@ class ChatClient(Client):
 
     def prev_thread(self, n=0):
         n = max(1, n)
-        self.current = max(0, self.current - n)
-        self.markAsRead(self.threads[self.current].uid)
+        self.tid = max(0, self.tid- n)
+        self.markAsRead(self.threads[self.tid].uid)
         self.update_bar()
         self.display_chat()
 
     def next_thread(self, n=0):
         n = max(1, n)
-        self.current = min(self.current + n, THREAD_MAX)
-        self.markAsRead(self.threads[self.current].uid)
+        self.tid = min(self.tid+ n, THREAD_MAX)
+        self.markAsRead(self.threads[self.tid].uid)
         self.update_bar()
         self.display_chat()
 
+    def scroll_up(self, n=0):
+        n = max(1, n)
+        n = min(n, HISTORY_MAX)
+        if not self.scrolling:
+            self.scrolling = True
+            ts = self.fetchThreadMessages(thread_id=self.threads[self.tid].uid, limit=1)[0].timestamp
+            self.history.append(ts)
+            if n > 1:
+                self.scroll_up(n-1)
+            else:
+                self.display_chat(ts)
+        elif len(self.history) < HISTORY_MAX:
+            messages = self.fetchThreadMessages(thread_id=self.threads[self.tid].uid, limit=n+1, before=self.history[-1])
+            timestamps = [t.timestamp for t in messages[1:]]
+            self.history.extend(timestamps)
+            self.display_chat(timestamps[-1])
+
+    def scroll_down(self, n=0):
+        if self.scrolling:
+            n = max(1, n)
+            n = min(n, len(self.history))
+            if n > 1:
+                del self.history[-(n-1):]
+            else:
+                self.history.pop()
+            if len(self.history) == 1:
+                self.scrolling = False
+            self.display_chat(self.history[-1])
+
     def getin(self):
-        if mode == Mode.CHAT:
+        if client.mode == Mode.CHAT:
             self.textbox.edit(validate)
             return self.textbox.gather()
-        elif mode == Mode.NAVI:
+        elif client.mode == Mode.NAVI:
             return self.w_chat.window.getch()
 
     def clear_textbox(self):
@@ -138,7 +198,13 @@ class ChatClient(Client):
         self.w_text.update()
 
     def message(self, msg):
-        self.send(Message(text=msg), thread_id=self.threads[self.current].uid, thread_type=self.threads[self.current].type)
+        self.send(Message(text=msg), thread_id=self.threads[self.tid].uid, thread_type=self.threads[self.tid].type)
+
+    def get_name(self, uid):
+        if uid not in self.name_cache:
+            retval = self.fetchThreadInfo(uid)[uid]
+            self.name_cache[uid] = retval.name
+        return self.name_cache[uid]
 
 class Panel:
     def __init__(self, height, width, y, x, outline = True):
@@ -181,17 +247,9 @@ def login(usr, pwd):
 def listen_thread():
     client.listen()
 
-def get_name(uid):
-    if uid not in name_cache:
-        retval = client.fetchThreadInfo(uid)[uid]
-        name_cache[uid] = retval.name
-    return name_cache[uid]
-
 def validate(ch):
-    global mode
-
     if ch == 27:
-        mode = Mode.NAVI
+        client.mode = Mode.NAVI
         return 7
     elif ch == 10 or ch == 13 or ch == curses.KEY_ENTER:
         return 7
@@ -199,7 +257,6 @@ def validate(ch):
         return ch
 
 def chat(stdscr):
-    global mode
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_CYAN, -1)
@@ -234,11 +291,11 @@ def chat(stdscr):
         client.update_all()
         curses.doupdate()
         out = client.getin()
-        if mode == Mode.CHAT and len(out) > 0:
+        if client.mode == Mode.CHAT and len(out) > 0:
             client.message(out)
             client.display_chat()
             client.clear_textbox()
-        elif mode == Mode.NAVI:
+        elif client.mode == Mode.NAVI:
             client.w_chat.active = True
             client.w_text.active = False
             if type(out) is int:
@@ -247,7 +304,7 @@ def chat(stdscr):
             if out == 'q':
                 return
             elif out == 'i':
-                mode = Mode.CHAT
+                client.mode = Mode.CHAT
                 client.w_chat.active = False
                 client.w_text.active = True
                 client.w_text.window.clear()
@@ -255,6 +312,10 @@ def chat(stdscr):
                 client.prev_thread(int(acc))
             elif out == 'l' or out == curses.KEY_RIGHT:
                 client.next_thread(int(acc))
+            elif out == 'k' or out == curses.KEY_UP:
+                client.scroll_up(int(acc))
+            elif out == 'j' or out == curses.KEY_DOWN:
+                client.scroll_down(int(acc))
             elif out.isdigit():
                 acc += out
             if not out.isdigit():
