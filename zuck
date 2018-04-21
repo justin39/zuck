@@ -3,6 +3,7 @@ import curses
 import curses.textpad
 import threading
 import logging.config
+import textwrap
 from fbchat import Client
 from fbchat.models import *
 from sys import exit
@@ -17,78 +18,127 @@ class Mode(Enum):
 name_cache = {}
 client = None
 mode = Mode.NAVI
+THREAD_MAX = 20
 
 class ChatClient(Client):
-    chat = None
-    def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
-        if not self.chat.scrolling and thread_id == self.chat.threads[self.chat.idx].uid:
-            self.chat.display_chat()
-        else:
-            self.chat.update_bar()
-
-class ChatState:
-    def __init__(self, chatwin, bar):
+    def __init__(self, *args, **kwargs):
+        super(ChatClient, self).__init__(*args, **kwargs)
         self.scrolling = False
-        self.chatwin = chatwin
-        self.bar = bar
+        self.w_chat = None
+        self.w_bar = None
+        self.w_text = None
+        self.textbox = None
+        self.threads = None
+        self.current = 0
+
+    def init_chat(self):
         self.threads = client.fetchThreadList()
-        self.idx = 0
+        lines = curses.LINES - 1
+        cols = curses.COLS
+        height = lines - 3
+        width = cols//3
+
+        # Chat window
+        self.w_chat = Panel(height, width, 2, 0)
+        self.w_chat.active = True
+        self.w_chat.window.idlok(True)
+        self.w_chat.window.scrollok(True)
+
+        # Status bar
+        self.w_bar = Panel(2, cols, 0, 0, False)
+
+        # Text input
+        self.w_text = Panel(4, width - 4, height - 4, width + 5)
+        self.textbox = curses.textpad.Textbox(self.w_text.window)
+        self.w_text.window.scrollok(True)
+
+        self.update_bar()
+        self.display_chat()
+
+
+    def onMessage(self, mid, author_id, message_object, thread_id, thread_type, ts, metadata, msg, **kwargs):
+        if not self.scrolling and thread_id == self.threads[self.current].uid:
+            self.display_chat()
+        else:
+            self.update_bar()
 
     def display_chat(self, timestamp=None):
-        messages = client.fetchThreadMessages(self.threads[self.idx].uid, limit=20, before=timestamp)
+        messages = self.fetchThreadMessages(self.threads[self.current].uid, limit=THREAD_MAX, before=timestamp)
         messages.reverse()
         for msg in messages:
             attr = 0
             if msg.author == client.uid:
                 attr = curses.color_pair(5)
-            self.chatwin.window.addstr(get_name(msg.author) + ":\n", attr | curses.A_BOLD)
+            self.w_chat.window.addstr(get_name(msg.author) + ":\n", attr | curses.A_BOLD)
             if msg.author == client.uid:
                 attr = curses.color_pair(4)
             if msg.text:
-                self.chatwin.window.addstr(msg.text + "\n\n", attr)
-            elif msg.sticker:
-                self.chatwin.window.addstr('[' + msg.sticker.label + ']\n\n', attr)
-        self.chatwin.refresh()
+                self.w_chat.window.addstr(msg.text + "\n\n", attr)
+            if msg.attachments:
+                for a in msg.attachments:
+                    url = client.fetchImageUrl(a.uid)
+                    self.w_chat.window.addstr(url + "\n")
+            if msg.sticker:
+                self.w_chat.window.addstr('[' + msg.sticker.url + ']\n\n', attr)
+        self.w_chat.refresh()
+        self.w_text.refresh()
 
     def update_bar(self):
-        tid = self.threads[self.idx].uid
-        self.bar.window.erase()
-        self.threads = client.fetchThreadList()
+        tid = self.threads[self.current].uid
+        self.w_bar.window.erase()
+        self.threads = self.fetchThreadList()
         unread = client.fetchUnread()
         written = 0
         i = 0
-        while written < self.bar.width:
+        while written < self.w_bar.width:
             attr = 0
             if self.threads[i].uid == tid:
                 attr = curses.A_UNDERLINE | curses.color_pair(2)
-                self.idx = i
+                self.current = i
             if self.threads[i].uid in unread:
                 attr |= curses.A_BOLD
-            self.bar.window.addstr(self.threads[i].name, attr)
+            self.w_bar.window.addstr(self.threads[i].name, attr)
             i += 1
             written += len(self.threads[i].name)
-            if len(self.threads[i].name) + 3 + written > self.bar.width:
+            if len(self.threads[i].name) + 3 + written > self.w_bar.width:
                 break
             else:
-                self.bar.window.addstr(' | ')
+                self.w_bar.window.addstr(' | ')
                 written += 3
-        self.bar.refresh()
+        self.w_bar.refresh()
+        self.w_text.refresh()
 
-    def prev_thread(self):
-        if self.idx == 0:
-            return
-        self.idx -= 1
-        client.markAsRead(self.threads[self.idx].uid)
+    def prev_thread(self, n=0):
+        n = max(1, n)
+        self.current = max(0, self.current - n)
+        self.markAsRead(self.threads[self.current].uid)
         self.update_bar()
         self.display_chat()
 
-    def next_thread(self):
-        if self.idx == 19:
-            return
-        self.idx += 1
-        client.markAsRead(self.threads[self.idx].uid)
+    def next_thread(self, n=0):
+        n = max(1, n)
+        self.current = min(self.current + n, THREAD_MAX)
+        self.markAsRead(self.threads[self.current].uid)
         self.update_bar()
         self.display_chat()
+
+    def getin(self):
+        if mode == Mode.CHAT:
+            self.textbox.edit(validate)
+            return self.textbox.gather()
+        elif mode == Mode.NAVI:
+            return self.w_chat.window.getch()
+
+    def clear_textbox(self):
+        self.w_text.window.erase()
+
+    def update_all(self):
+        self.w_bar.update()
+        self.w_chat.update()
+        self.w_text.update()
+
+    def message(self, msg):
+        self.send(Message(text=msg), thread_id=self.threads[self.current].uid, thread_type=self.threads[self.current].type)
 
 class Panel:
     def __init__(self, height, width, y, x, outline = True):
@@ -161,70 +211,54 @@ def chat(stdscr):
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
-    # curses.curs_set(False)
 
     lines = curses.LINES - 1
     cols = curses.COLS
     height = lines - 3
     width = cols//3
 
-    # Initial chat
-    thlist = client.fetchThreadList(limit=1)
+    client.init_chat()
 
-    win = Panel(height, width, 2, 0)
-    win.active = True
-    win.window.idlok(True)
-    win.window.scrollok(True)
+    # Draw box for aesthetics
+    box = Panel(height, width, 2, width+3)
+    box.update()
 
     # Listening thread
     lthread = threading.Thread(target=listen_thread)
     lthread.daemon = True
     lthread.start()
 
-    # Next panel
-    panel = Panel(height, width, 2, width+3)
-
-    # Text input
-    textwin = Panel(height//3, width - 4, height - height//3 + 1, width + 5)
-    textbox = curses.textpad.Textbox(textwin.window)
-
-    # Status bar
-    bar = Panel(2, cols, 0, 0, False)
-
-    cs = ChatState(win, bar)
-    client.chat = cs
-    cs.display_chat()
-    cs.update_bar()
+    acc = '0'
 
     while (True):
-        bar.update()
-        win.update()
-        panel.update()
-        textwin.update()
+        client.update_all()
         curses.doupdate()
-        if mode == Mode.CHAT:
-            textbox.edit(validate)
-            message = textbox.gather()
-            textwin.window.clear()
-            if mode == Mode.CHAT and len(message) > 0:
-                client.send(Message(text=message), thread_id=cs.threads[cs.idx].uid, thread_type=cs.threads[cs.idx].type)
-                cs.display_chat()
-            elif mode == Mode.NAVI:
-                win.active = True
-                textwin.active = False
-                continue
+        out = client.getin()
+        if mode == Mode.CHAT and len(out) > 0:
+            client.message(out)
+            client.display_chat()
+            client.clear_textbox()
         elif mode == Mode.NAVI:
-            ch = win.window.getch()
-            if ch == ord('q'):
+            client.w_chat.active = True
+            client.w_text.active = False
+            if type(out) is int:
+                out = chr(out)
+
+            if out == 'q':
                 return
-            elif ch == ord('i'):
+            elif out == 'i':
                 mode = Mode.CHAT
-                win.active = False
-                textwin.active = True
-            elif ch == ord('h') or ch == curses.KEY_LEFT:
-                cs.prev_thread()
-            elif ch == ord('l') or ch == curses.KEY_RIGHT:
-                cs.next_thread()
+                client.w_chat.active = False
+                client.w_text.active = True
+                client.w_text.window.clear()
+            elif out == 'h' or out == curses.KEY_LEFT:
+                client.prev_thread(int(acc))
+            elif out == 'l' or out == curses.KEY_RIGHT:
+                client.next_thread(int(acc))
+            elif out.isdigit():
+                acc += out
+            if not out.isdigit():
+                acc = '0'
 
 if __name__ == '__main__':
     from sys import argv
